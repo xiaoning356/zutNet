@@ -1,0 +1,44 @@
+name: Build and Release Windows EXE
+
+on:
+  push:
+    tags:
+      - 'v*' # 仅当推送符合 v1.0.0 这类 tag 时触发
+
+permissions:
+  contents: write # 赋予 Action 创建/修改 Release 的权限
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14.7' # 根据实际项目需求指定版本
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
+
+      - name: Build EXE with PyInstaller
+        run: |
+          # 替换 main.py 为你的入口文件名
+          # --onefile: 打包为单文件
+          # --noconsole: 如果是 GUI 程序可加上此参数以隐藏控制台窗口
+          pyinstaller --noconfirm --onedir --clean --onefile --name "zutnet-${{ github.ref_name }}" net.py
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe
+          generate_release_notes: true # 自动提取自上个版本以来的 commit 作为 release log
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
