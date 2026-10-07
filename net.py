@@ -8,26 +8,43 @@ from urllib.error import HTTPError, URLError
 
 PORTAL_URL = "http://1.1.1.1"  # 校园网登录页
 LOGIN_URL = "http://1.1.1.1:801/eportal/"  # eportal 登录接口
-EPORTAL_PROBE_URL = "http://1.1.1.1:801/"  # 只用于探测 AC 是否在本网，不参与登录
 TIMEOUT = 5  # 请求超时(秒)
-PROBE_TIMEOUT = 2.5  # 探测 eportal 端口的超时(秒)：校外没人应答，尽快放弃
 
 BAD_IPS = {"", "null", "0.0.0.0", "000.000.000.000.", "127.0.0.1"}  # 解析 IP 时视为无效的值
 
 # ---------------- 校园网识别 ----------------
-# http://1.1.1.1 在校内是 AC 拦截后给出的登录页，在校外则是 Cloudflare 的公共 DNS 官网，
-# 两者完全是两个网站，所以必须先辨认“我到底在不在本校校园网”，再决定要不要登录。
-# 只要正文 / 最终地址 / Server 头里出现以下任一特征，就认为拿到的是本校门户页面。
+# 校内访问 http://1.1.1.1 拿到的一定是 Dr.COM AC 的门户页面：
+#   未登录 -> 登录页(a70.htm，页面标识 Dr.COMWebLoginID_0)
+#   已登录 -> 注销页(页面标识 Dr.COMWebLoginID_1，并带 uid / v4ip 等在线信息)
+# Server 头是 DrcomServer1.0 / OMPXY。校外访问同一个地址拿到的是 Cloudflare 的公共 DNS
+# 官网，或者干脆连不通。所以判断规则只有一条：
+#   能拿到带门户特征的页面 = 在本校校园网内，接着再判断登录状态；
+#   拿不到、或页面没有门户特征 = 非本校校园网，直接提示并正常退出。
 CAMPUS_MARKERS = (
-    "comwebloginid_",  # 登录页 COMWebLoginID_0、登录成功页 COMWebLoginID_3
+    "dr.com",          # Dr.COM 门户，页面标识里就带这个前缀
+    "comwebloginid_",  # 门户页面标识：Dr.COMWebLoginID_0/_1/_3
     "eportal",
     "acsetting",
     "a70.htm",
     "wlanuserip",
-    "dr.com",
+    "drcomserver",     # Server: DrcomServer1.0
+    "ompxy",           # Server: OMPXY/1.4.7
 )
 
-# 公网 1.1.1.1 是 Cloudflare 的服务（http://1.1.1.1 会跳到它的官网），用这些特征识别公网页面。
+# 门户登录页特征：出现就说明还没登录
+LOGIN_PAGE_MARKERS = (
+    "comwebloginid_0",  # 登录页标识
+    "a70.htm",          # 登录页文件名
+)
+
+# 门户注销页特征：出现就说明已经登录；注销页里还带着当前在线账号 uid='学号@运营商'
+ONLINE_PAGE_MARKERS = (
+    "comwebloginid_1",  # 注销页标识
+    "注销页",
+)
+ONLINE_UID_RE = re.compile(r"uid\s*=\s*'[^']*@", re.I)
+
+# 公网 1.1.1.1 是 Cloudflare 的服务，只在提示里用来解释“为什么判断为非校园网”
 CLOUDFLARE_MARKERS = (
     "cloudflare",
     "one.one.one.one",
@@ -257,82 +274,51 @@ def _marker_hit(resp, markers):
 
 
 def looks_like_campus_portal(resp):
-    """响应是不是本校门户的页面（登录页或登录结果页）。"""
+    """响应是不是本校校园网门户（Dr.COM AC）的页面。"""
     return _marker_hit(resp, CAMPUS_MARKERS)
 
 
 def looks_like_public_cloudflare(resp):
-    """响应是不是公网 1.1.1.1（Cloudflare）的页面。"""
+    """响应是不是公网 1.1.1.1（Cloudflare）的页面，只用于把提示原因写清楚。"""
     return _marker_hit(resp, CLOUDFLARE_MARKERS)
 
 
-def eportal_reachable(timeout=PROBE_TIMEOUT):
+def portal_logged_in(resp):
     """
-    探测校园网 AC 的 eportal 端口(1.1.1.1:801)是否有人应答。
+    门户页面是否表示“已经登录”。
 
-    校内的 1.1.1.1:801 由 AC 自己应答（与是否已登录无关）；校外的 1.1.1.1 属于
-    Cloudflare，801 端口没人监听，连接被拒绝或超时。所以这个探测能把
-    “在校园网内但已经登录”（80 端口不再被拦截，801 仍由 AC 应答）
-    和“根本不在校园网”区分开。
+    已登录时门户给的是注销页（Dr.COMWebLoginID_1，带 uid='学号@运营商'）；
+    未登录时给的是登录页（Dr.COMWebLoginID_0 / a70.htm）。
+    两者都认不出来时按“未登录”处理：多登录一次没有副作用，漏登录会一直上不了网。
     """
-    try:
-        resp = request(EPORTAL_PROBE_URL, timeout=timeout)
-    except (URLError, OSError, ValueError):
-        return False  # 连不上就是没人应答
-
-    if looks_like_public_cloudflare(resp):
-        return False  # 应答来自公网 1.1.1.1，不是本校 AC
-    if looks_like_campus_portal(resp):
-        return True
-    # 没特征也没关系，但要确认应答还挂在 1.1.1.1 上（被重定向到别的域名说明是别人家的网络）
-    return urllib.parse.urlparse(resp.url).hostname == urllib.parse.urlparse(EPORTAL_PROBE_URL).hostname
-
-
-def classify_portal(resp):
-    """
-    判断访问 http://1.1.1.1 拿到的东西属于哪种情况：
-
-    - "login" ：本校门户登录页，需要登录
-    - "online"：在本校校园网内，且已经登录
-    - "off"   ：不在本校校园网
-    """
-    if looks_like_campus_portal(resp):
-        return "login"
-    # 没有登录页特征：要么已经登录（门户不再拦截），要么压根不在校园网。
-    # 此时有没有 AC 应答 801 端口就是关键证据。
-    if eportal_reachable():
-        return "online"
-    return "off"
+    if _marker_hit(resp, LOGIN_PAGE_MARKERS):
+        return False
+    return _marker_hit(resp, ONLINE_PAGE_MARKERS) or bool(ONLINE_UID_RE.search(resp.text))
 
 
 def check():
     """
-    访问门户判断校园网状态，返回 (status, resp)：
+    检查校园网状态，返回 (status, resp)：
 
-    - status == "login" ：在本校校园网且未登录，resp 可继续用来解析本机 IP
-    - status == "online"：在本校校园网且已登录（此时 resp 可能为 None）
+    - "login" ：在本校校园网内，且未登录（resp 可继续用来解析本机 IP）
+    - "online"：在本校校园网内，且已登录
 
-    不在本校校园网时抛 OffCampusError，由 main() 统一提示并正常退出。
+    非本校校园网（1.1.1.1 连不上，或拿到的页面没有本校门户特征）时抛 OffCampusError，
+    由 main() 提示“位于非本校校园网”并正常退出。
     """
     try:
         resp = request(PORTAL_URL)
     except (URLError, OSError, ValueError) as e:
-        # 门户打不开有两种可能：一是不在校园网，二是“在校内但已经登录”——
-        # 登录后 80 端口不再被 AC 拦截，而公网 1.1.1.1 在国内多半连不通。
-        # 用 AC 的 801 端口做最终判断，避免把已登录误报成非本校校园网。
-        if eportal_reachable():
-            return "online", None
         raise OffCampusError(f"无法访问校园网登录页 {PORTAL_URL}（{e}）")
 
-    status = classify_portal(resp)
-    if status != "off":
-        return status, resp
+    if not looks_like_campus_portal(resp):
+        if looks_like_public_cloudflare(resp):
+            reason = f"{PORTAL_URL} 返回的是公网 Cloudflare 页面（{resp.url}），不是本校门户页面"
+        else:
+            reason = f"{PORTAL_URL} 没有返回本校门户页面（{resp.url}）"
+        raise OffCampusError(reason)
 
-    if looks_like_public_cloudflare(resp):
-        reason = f"{PORTAL_URL} 返回的是公网 Cloudflare 页面（{resp.url}），不是本校登录页"
-    else:
-        reason = f"{PORTAL_URL} 没有返回本校门户页面（{resp.url}）"
-    raise OffCampusError(f"{reason}，且 eportal（1.1.1.1:801）无应答")
+    return ("online" if portal_logged_in(resp) else "login"), resp
 
 
 def build_login_url(ip, ac_params=None):
@@ -435,14 +421,19 @@ def create_template_and_report(target):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
 
-    # 先确认自己在不在本校校园网里。校外访问 http://1.1.1.1 会落到 Cloudflare 官网，
-    # 继续往下走只会得到莫名其妙的“登录失败”，所以这里直接提示并正常退出。
+    # 先确认自己在不在本校校园网里。校外访问 http://1.1.1.1 拿到的是 Cloudflare 官网或连不通，
+    # 这里直接提示并正常退出，不再往下折腾登录接口。
     try:
         status, portal = check()
     except OffCampusError as e:
         print(f"位于非本校校园网：{e}")
         print("当前不在校园网环境，无需登录，脚本正常退出。")
         pause_if_console()
+        return 0
+
+    # 已经在网就不用读账号密码了
+    if status == "online":
+        print("已是登录状态！")
         return 0
 
     try:
@@ -458,11 +449,6 @@ def main(argv=None):
         return 2
 
     print(f"配置文件: {path}")
-
-    if status == "online":
-        print("已是登录状态！")
-        return 0
-
     print("未登录")
     login(user, password, operator, ip, portal)
     return 0
