@@ -2,6 +2,7 @@ import configparser
 import os
 import re
 import sys
+import traceback
 import urllib.parse
 import urllib.request
 from urllib.error import HTTPError, URLError
@@ -180,10 +181,15 @@ def read_account(path):
 
 
 def pause_if_console():
-    """双击运行时出错后窗口会立刻关闭，这里等一下让用户看清提示（管道/重定向时不等待）。"""
+    """
+    停下来等用户按回车，让双击运行的人有时间看清结果。
+
+    只有在“真有控制台”时才等：双击 / 在终端里手动运行会暂停；
+    计划任务、把输出重定向到文件（isatty 为 False）不会暂停，避免卡住出错。
+    """
     try:
         if sys.stdin and sys.stdin.isatty() and sys.stdout.isatty():
-            input("按回车键退出...")
+            input("\n按回车键退出...")
     except (EOFError, OSError):
         pass
 
@@ -363,8 +369,7 @@ def login(user, password, operator, ip="", portal=None):
             print(f"获取ip成功: {ip}")
         else:
             print("获取ip失败")
-            pause_if_console()
-            sys.exit(1)
+            sys.exit(1)  # 退出去之前由 run() 统一停住等回车
         ac_params = parse_ac_params(portal.url)
     else:
         ac_params = {}
@@ -394,8 +399,7 @@ def login(user, password, operator, ip="", portal=None):
         resp_text = request(url, data=data).text
     except URLError as e:
         print("登录请求失败:", e)
-        pause_if_console()
-        sys.exit(1)
+        sys.exit(1)  # 退出去之前由 run() 统一停住等回车
 
     if "COMWebLoginID_3" in resp_text or user in resp_text:
         print("登录成功!")
@@ -414,7 +418,6 @@ def create_template_and_report(target):
     else:
         print(f"未找到配置文件，已生成模板: {target}")
         print("请填写 user / password / operator（可选 ip）后重新运行。")
-    pause_if_console()
     return 2
 
 
@@ -428,7 +431,6 @@ def main(argv=None):
     except OffCampusError as e:
         print(f"位于非本校校园网：{e}")
         print("当前不在校园网环境，无需登录，脚本正常退出。")
-        pause_if_console()
         return 0
 
     # 已经在网就不用读账号密码了
@@ -445,13 +447,35 @@ def main(argv=None):
         user, password, operator, ip = read_account(path)
     except ConfigError as e:
         print("配置错误:", e)
-        pause_if_console()
         return 2
 
     print(f"配置文件: {path}")
     print("未登录")
     login(user, password, operator, ip, portal)
     return 0
+
+
+def run(argv=None):
+    """
+    执行 main()，并保证无论怎么结束，退出去之前都停在“按回车键退出...”上：
+
+    - 正常结束 / main() 返回非 0：保留退出码；
+    - 脚本内部 sys.exit(...)：退出码照旧，不再重复提示；
+    - 没预料到的异常：先把 traceback 打完，再停住等回车，
+      这样双击运行时不会“报错一闪、窗口就没了”。
+
+    计划任务、管道重定向时没控制台，pause_if_console() 会自动跳过，不会卡住。
+    """
+    try:
+        return main(argv)
+    except SystemExit as e:  # main() 内部（如获取 IP 失败）直接 sys.exit 的情况
+        status = getattr(e, "code", 0)
+        return status if isinstance(status, int) else (0 if status is None else 1)
+    except Exception:
+        traceback.print_exc()  # 先打完异常信息，再由 finally 停住
+        return 1
+    finally:
+        pause_if_console()
 
 
 def setup_console():
@@ -469,4 +493,4 @@ def setup_console():
 
 if __name__ == "__main__":
     setup_console()
-    sys.exit(main())
+    sys.exit(run())
